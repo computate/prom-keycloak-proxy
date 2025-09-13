@@ -63,8 +63,8 @@ func InjectMatcher(q url.Values, matcher *labels.Matcher) error {
 	return nil
 }
 
-func AppendMatcher(queryValues url.Values, queryValuesForAuth url.Values, key string, authKey string, defaultValue string) (string, error) {
-	value := defaultValue
+func AppendMatcher(queryValues url.Values, queryValuesForAuth []labels.Matcher, key string, authKey string, defaultValue string) ([]labels.Matcher, error) {
+	var returnMatchers []labels.Matcher
 	expr, exprErr := parser.ParseExpr(queryValues[QueryParam][0])
 	matchers := parser.ExtractSelectors(expr)
 	if exprErr != nil {
@@ -73,25 +73,35 @@ func AppendMatcher(queryValues url.Values, queryValuesForAuth url.Values, key st
 	for _, matcherSelector := range matchers {
 		for _, matcherSelector := range matcherSelector {
 			if matcherSelector.Name == key {
-				value = matcherSelector.Value
+				if matcherSelector.Type == labels.MatchRegexp {
+					values := strings.Split(matcherSelector.Value, "|")
+					for _, value := range values {
+						matcher := labels.Matcher{
+							Name:  authKey,
+							Type:  labels.MatchRegexp,
+							Value: LabelValuesToRegexpString([]string{value}),
+						}
+						queryValuesForAuth = append(queryValuesForAuth, matcher)
+						returnMatchers = append(returnMatchers, matcher)
+					}
+				}
+				if matcherSelector.Type == labels.MatchEqual {
+					matcher := labels.Matcher{
+						Name:  authKey,
+						Type:  labels.MatchRegexp,
+						Value: LabelValuesToRegexpString([]string{matcherSelector.Value}),
+					}
+					queryValuesForAuth = append(queryValuesForAuth, matcher)
+					returnMatchers = append(returnMatchers, matcher)
+				}
 			}
 		}
 	}
-
-	if value != "" {
-		matcher := &labels.Matcher{
-			Name:  authKey,
-			Type:  labels.MatchRegexp,
-			Value: LabelValuesToRegexpString([]string{value}),
-		}
-		err := InjectMatcher(queryValuesForAuth, matcher)
-		return value, err
-	}
-	return value, nil
+	return returnMatchers, nil
 }
 
-func ParseAuthorizations(hubKey string, clusterKey string, projectKey string, hub string, queryValues url.Values) (url.Values, []string, []string) {
-	queryValuesForAuth := make(url.Values)
+func ParseAuthorizations(hubKey string, clusterKey string, projectKey string, hub string, queryValues url.Values) ([]labels.Matcher, []string, []string) {
+	var queryValuesForAuth []labels.Matcher
 
 	var authResourceNames []string
 	var authScopeNames []string
@@ -102,19 +112,34 @@ func ParseAuthorizations(hubKey string, clusterKey string, projectKey string, hu
 	authResourceNames = append(authResourceNames, fmt.Sprintf("%s-%s", hubKey, hub))
 	authScopeNames = append(authScopeNames, "GET")
 
-	cluster, _ := AppendMatcher(queryValues, queryValuesForAuth, "cluster", fmt.Sprintf("%s-%s-%s", hubKey, hub, clusterKey), "")
+	clusters, _ := AppendMatcher(queryValues, queryValuesForAuth, "cluster", fmt.Sprintf("%s-%s-%s", hubKey, hub, clusterKey), "")
 
-	if cluster != "" {
-		authResourceNames = append(authResourceNames, fmt.Sprintf("%s-%s-%s-%s", hubKey, hub, clusterKey, cluster))
-		authScopeNames = append(authScopeNames, "GET")
+	if len(clusters) > 0 {
+		for _, clusterMatcher := range clusters {
+			authResourceNames = append(authResourceNames, fmt.Sprintf("%s-%s-%s-%s", hubKey, hub, clusterKey, clusterMatcher.Value))
+			authScopeNames = append(authScopeNames, "GET")
 
-		exported_namespace, _ := AppendMatcher(queryValues, queryValuesForAuth, "exported_namespace", fmt.Sprintf("%s-%s-%s-%s-%s", hubKey, hub, clusterKey, cluster, projectKey), "")
-		namespace, _ := AppendMatcher(queryValues, queryValuesForAuth, "namespace", fmt.Sprintf("%s-%s-%s-%s-%s", hubKey, hub, clusterKey, cluster, projectKey), exported_namespace)
-
-		if namespace != "" {
-			if cluster != "" {
-				authResourceNames = append(authResourceNames, fmt.Sprintf("%s-%s-%s-%s-%s-%s", hubKey, hub, clusterKey, cluster, projectKey, namespace))
-				authScopeNames = append(authScopeNames, "GET")
+			exported_namespaces, _ := AppendMatcher(queryValues, queryValuesForAuth, "exported_namespace", fmt.Sprintf("%s-%s-%s-%s-%s", hubKey, hub, clusterKey, clusterMatcher.Value, projectKey), "")
+			if len(exported_namespaces) > 0 {
+				if len(clusters) > 0 {
+					for _, clusterMatcher := range clusters {
+						for _, exportedNamespaceMatcher := range exported_namespaces {
+							authResourceNames = append(authResourceNames, fmt.Sprintf("%s-%s-%s-%s-%s-%s", hubKey, hub, clusterKey, clusterMatcher.Value, projectKey, exportedNamespaceMatcher.Value))
+							authScopeNames = append(authScopeNames, "GET")
+							namespaces, _ := AppendMatcher(queryValues, queryValuesForAuth, "namespace", fmt.Sprintf("%s-%s-%s-%s-%s", hubKey, hub, clusterKey, clusterMatcher.Value, projectKey), exportedNamespaceMatcher.Value)
+							if len(namespaces) > 0 {
+								if len(clusters) > 0 {
+									for _, clusterMatcher := range clusters {
+										for _, namespaceMatcher := range namespaces {
+											authResourceNames = append(authResourceNames, fmt.Sprintf("%s-%s-%s-%s-%s-%s", hubKey, hub, clusterKey, clusterMatcher.Value, projectKey, namespaceMatcher.Value))
+											authScopeNames = append(authScopeNames, "GET")
+										}
+									}
+								}
+							}
+						}
+					}
+				}
 			}
 		}
 	}
